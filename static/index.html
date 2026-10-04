@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+  <meta charset="utf-8">
+  <title>流媒体控制台</title>
+  <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+  <!-- <script src="./flv.js"></script> -->
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 24px;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-bottom: 24px;
+    }
+
+    th,
+    td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+
+    th {
+      background: #f5f5f5;
+    }
+
+    video {
+      width: 480px;
+      background: #000;
+    }
+
+    code {
+      background: #f0f0f0;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>流媒体控制台</h1>
+  <p>推流地址：<code>rtmp://localhost:1935/live/live_test</code></p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>流 ID</th>
+        <th>推流方</th>
+        <th>App</th>
+        <th>观众数</th>
+        <th>HTTP-FLV 地址</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div id="players"></div>
+
+  <script>
+    const rows = document.getElementById("rows");
+    const players = document.getElementById("players");
+    const active = new Map();
+
+    async function refresh() {
+      const API_BASE = "http://localhost:8080";
+      const res = await fetch(`${API_BASE}/api/streams`);
+      const streams = await res.json();
+
+      rows.innerHTML = "";
+      for (const s of streams) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${s.stream_key}</td>
+          <td>${s.publisher}</td>
+          <td>${s.app}</td>
+          <td>${s.viewers}</td>
+          <td><code>${s.flv_url}</code></td>
+          <td><button data-key="${s.stream_key}">播放</button></td>
+        `;
+        tr.querySelector("button").onclick = () => play(s);
+        rows.appendChild(tr);
+      }
+    }
+
+    function play(stream) {
+      if (active.has(stream.stream_key)) return;
+      const wrapper = document.createElement("div");
+      wrapper.innerHTML = `<h3>${stream.stream_key}</h3>`;
+      const video = document.createElement("video");
+      video.controls = true;
+      video.muted = true;
+      wrapper.appendChild(video);
+      players.appendChild(wrapper);
+      const API_BASE = "http://localhost:8080";
+      const url = `${API_BASE}/live/${stream.stream_key}`;
+      const player = flvjs.createPlayer({
+        type: "flv",
+        url,
+        isLive: true,
+      });
+      player.attachMediaElement(video);
+      player.load();
+      player.play();
+      active.set(stream.stream_key, player);
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+
+</html>
