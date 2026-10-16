@@ -16,6 +16,7 @@ struct StreamEntry {
     cache: StreamCache,
     publisher: String,
     app: String,
+    session_id: u64,
 }
 
 #[derive(Default)]
@@ -38,14 +39,15 @@ impl Hub {
         Self::default()
     }
 
-    /// 推流开始：建通道与缓存。
-    pub fn create(&self, key: &str, publisher: String, app: String) {
+    /// 推流开始：建通道与缓存，并记住归属会话以便断连时回收。
+    pub fn create(&self, session_id: u64, key: &str, publisher: String, app: String) {
         let (tx, _) = broadcast::channel(1024);
         let entry = StreamEntry {
             tx,
             cache: StreamCache::default(),
             publisher,
             app,
+            session_id,
         };
         self.streams.lock().unwrap().insert(key.to_string(), entry);
     }
@@ -53,6 +55,16 @@ impl Hub {
     /// 推流结束：移除整条流。
     pub fn remove(&self, key: &str) {
         self.streams.lock().unwrap().remove(key);
+    }
+
+    /// 连接断开：移除该会话推送的全部流。
+    /// 一条 RTMP 连接可以推多条流，而异常断开不会触发 `on_unpublish`，
+    /// 只按 key 清理会留下永久残留的僵尸流。
+    pub fn remove_by_session(&self, session_id: u64) {
+        self.streams
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.session_id != session_id);
     }
 
     /// 收到一个媒体 tag：更新缓存并广播。

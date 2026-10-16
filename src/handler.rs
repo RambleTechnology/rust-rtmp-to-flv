@@ -19,6 +19,7 @@ impl RtmpHandler for FlvHandler {
         }
 
         self.hub.create(
+            ctx.session_id,
             &params.stream_key,
             ctx.peer_addr.to_string(),
             ctx.app.clone(),
@@ -28,6 +29,11 @@ impl RtmpHandler for FlvHandler {
 
     async fn on_unpublish(&self, ctx: &StreamContext) {
         self.hub.remove(&ctx.stream_key);
+    }
+
+    /// 连接关闭（含被强杀等异常断开）：回收该会话遗留的所有流。
+    async fn on_disconnect(&self, ctx: &SessionContext) {
+        self.hub.remove_by_session(ctx.session_id);
     }
 
     async fn on_media_tag(&self, ctx: &StreamContext, tag: &FlvTag) -> bool {

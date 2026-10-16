@@ -2,26 +2,29 @@ mod flv;
 mod handler;
 mod hub;
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::Router;
-use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use bytes::Bytes;
+use rocket::fs::FileServer;
+use rocket::http::{ContentType, Header, Status};
+use rocket::request::Request;
+use rocket::response::stream::ReaderStream;
+use rocket::response::{self, Responder};
+use rocket::serde::json::Json;
+use rocket::{get, routes, State};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::services::ServeDir;
 
 use rtmp_rs::server::{RtmpServer, ServerConfig};
 
 use crate::handler::FlvHandler;
-use crate::hub::Hub;
+use crate::hub::{Hub, StreamInfo};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// 用 `#[rocket::launch]` 而非 `#[tokio::main]`：后者会让 Rocket 运行在“别人的”
+/// runtime 里并禁用强制关闭（Ctrl+C 不生效）。launch 展开为
+/// `#[rocket::main] async fn main()`，此处 spawn 的 RTMP 任务落在 Rocket 自有 runtime 内。
+#[rocket::launch]
+async fn rocket() -> rocket::Rocket<rocket::Build> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -31,40 +34,56 @@ async fn main() -> anyhow::Result<()> {
 
     let hub = Arc::new(Hub::new());
 
-    // ---- HTTP 服务（axum）----
-    let app = Router::new()
-        .route("/api/streams", get(list_streams))
-        .route("/live/{key}", get(flv_stream))
-        .fallback_service(ServeDir::new("static"))
-        .with_state(hub.clone());
-
-    let http_bind = std::env::var("HTTP_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let listener = tokio::net::TcpListener::bind(&http_bind).await?;
-    tracing::info!("HTTP 控制台监听于 http://{http_bind}");
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
     // ---- RTMP 服务 ----
     let rtmp_bind = std::env::var("RTMP_BIND").unwrap_or_else(|_| "0.0.0.0:1935".into());
-    let config = ServerConfig::default().bind(rtmp_bind.parse()?);
-    let server = RtmpServer::new(config, FlvHandler { hub });
-    tracing::info!("RTMP 服务监听于 {rtmp_bind}");
+    let rtmp_addr: std::net::SocketAddr = rtmp_bind
+        .parse()
+        .unwrap_or_else(|e| panic!("RTMP_BIND {rtmp_bind} 解析失败: {e}"));
+    let server = RtmpServer::new(
+        ServerConfig::default().bind(rtmp_addr),
+        FlvHandler { hub: hub.clone() },
+    );
+    tokio::spawn(async move {
+        tracing::info!("RTMP 服务监听于 {rtmp_bind}");
+        if let Err(e) = server.run().await {
+            tracing::error!("RTMP 服务退出: {e:?}");
+        }
+    });
 
-    server.run().await?;
-    Ok(())
+    // ---- HTTP 服务（Rocket）----
+    let http_bind = std::env::var("HTTP_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let (address, port_str) = http_bind.split_once(':').unwrap_or(("0.0.0.0", "8080"));
+    let port: u16 = port_str
+        .parse()
+        .unwrap_or_else(|e| panic!("HTTP_BIND 端口 {port_str} 非法: {e}"));
+    let figment = rocket::Config::figment()
+        .merge(("address", address))
+        .merge(("port", port));
+
+    tracing::info!("HTTP 控制台监听于 http://{http_bind}");
+    rocket::custom(figment)
+        .manage(hub)
+        .mount("/", routes![list_streams, flv_stream])
+        .mount("/", FileServer::from("static"))
 }
 
 /// GET /api/streams
-async fn list_streams(State(hub): State<Arc<Hub>>) -> impl IntoResponse {
-    axum::Json(hub.list())
+#[get("/api/streams")]
+fn list_streams(hub: &State<Arc<Hub>>) -> Json<Vec<StreamInfo>> {
+    Json(hub.list())
 }
 
-/// GET /live/{key}.flv
-async fn flv_stream(State(hub): State<Arc<Hub>>, Path(key): Path<String>) -> Response {
-    let Some((backlog, rx)) = hub.subscribe(&key) else {
-        return (StatusCode::NOT_FOUND, "no such stream").into_response();
+/// GET /live/{key}
+#[get("/live/<key>")]
+fn flv_stream(
+    hub: &State<Arc<Hub>>,
+    key: &str,
+) -> Result<
+    FlvResponse<impl tokio_stream::Stream<Item = Bytes> + Send>,
+    (Status, &'static str),
+> {
+    let Some((backlog, rx)) = hub.subscribe(key) else {
+        return Err((Status::NotFound, "no such stream"));
     };
 
     // 1. FLV header
@@ -72,19 +91,32 @@ async fn flv_stream(State(hub): State<Arc<Hub>>, Path(key): Path<String>) -> Res
     // 3. 直播中的帧
     let head = tokio_stream::iter(
         std::iter::once(flv::flv_header())
-            .chain(backlog.into_iter().map(|tag| flv::encode_tag(&tag)))
-            .map(Ok::<Bytes, Infallible>),
+            .chain(backlog.into_iter().map(|tag| flv::encode_tag(&tag))),
     );
 
     let live = BroadcastStream::new(rx)
         .filter_map(|r| r.ok())
-        .map(|tag| Ok::<Bytes, Infallible>(flv::encode_tag(&tag)));
+        .map(|tag| flv::encode_tag(&tag));
 
-    let body = Body::from_stream(head.chain(live));
+    Ok(FlvResponse(head.chain(live)))
+}
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "video/x-flv")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(body)
-        .unwrap()
+/// 带 Content-Type / CORS 头的流式 FLV 响应。
+/// Rocket 的 `Response` 本身不实现 `Responder`，需要包一层。
+struct FlvResponse<S>(S)
+where
+    S: tokio_stream::Stream<Item = Bytes> + Send;
+
+impl<'r, S> Responder<'r, 'r> for FlvResponse<S>
+where
+    S: tokio_stream::Stream<Item = Bytes> + Send + 'r,
+{
+    fn respond_to(self, _: &'r Request<'_>) -> response::Result<'r> {
+        let body = ReaderStream::from(self.0.map(std::io::Cursor::new));
+        Ok(rocket::response::Response::build()
+            .header(ContentType::new("video", "x-flv"))
+            .header(Header::new("Access-Control-Allow-Origin", "*"))
+            .streamed_body(body)
+            .finalize())
+    }
 }
